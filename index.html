@@ -10,58 +10,129 @@
   html,body{margin:0;height:100%;background:var(--black);overflow:hidden;font-family:-apple-system,system-ui,sans-serif;-webkit-user-select:none;user-select:none}
   #light{position:fixed;inset:0;background:var(--yellow);display:none}
   #light.off{background:var(--black)}
+  #label{position:fixed;inset:0;display:none;align-items:center;justify-content:center;text-align:center;padding:32px;font-size:26px;font-weight:700;color:#000;line-height:1.3}
   #start{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;color:#fff;text-align:center;padding:24px}
   #start button{font-size:20px;font-weight:600;padding:16px 32px;border:0;border-radius:14px;background:var(--yellow);color:#000}
   #start p{max-width:320px;opacity:.75;font-size:15px;line-height:1.4;margin:0}
   #msg{color:#ff8a80;min-height:20px}
-  #stop{position:fixed;top:calc(env(safe-area-inset-top,0px) + 8px);right:8px;opacity:.25;border:0;background:#000;color:#fff;border-radius:8px;padding:6px 10px;font-size:13px;display:none}
-  #light.off ~ #stop{display:none!important}
+  .ctl{position:fixed;top:calc(env(safe-area-inset-top,0px) + 8px);opacity:.3;border:0;background:#000;color:#fff;border-radius:8px;padding:6px 10px;font-size:13px;display:none}
+  #stop{right:8px}
+  #recal{left:8px}
+  #dbg{position:fixed;bottom:calc(env(safe-area-inset-bottom,0px) + 6px);left:8px;font-size:11px;color:#000;opacity:.35;display:none}
+  #light.off ~ .ctl{display:none!important}
   video,canvas{position:fixed;width:1px;height:1px;opacity:0;pointer-events:none}
 </style>
 </head>
 <body>
 <div id="start">
   <h2>Yellow Light</h2>
-  <p>Cover the front camera with your hand and the light turns off. Remove it and it comes back. Safari will ask for camera access.</p>
+  <p>Cover the front camera with your hand and the light turns off. Remove it and it comes back. First you will do a quick 2-step calibration.</p>
   <button id="go">Start</button>
   <p id="msg"></p>
 </div>
 <div id="light"></div>
-<button id="stop">Stop</button>
+<div id="label"></div>
+<button id="stop" class="ctl">Stop</button>
+<button id="recal" class="ctl">Recalibrate</button>
+<div id="dbg"></div>
 <video id="v" playsinline muted autoplay></video>
 <canvas id="c" width="32" height="32"></canvas>
 <script>
 const $=id=>document.getElementById(id);
-const light=$('light'),startEl=$('start'),stopBtn=$('stop'),msg=$('msg'),v=$('v'),c=$('c');
+const light=$('light'),startEl=$('start'),label=$('label'),msg=$('msg'),dbg=$('dbg'),v=$('v'),c=$('c');
+const stopBtn=$('stop'),recalBtn=$('recal');
 const ctx=c.getContext('2d',{willReadFrequently:true});
-let stream=null,timer=null,wake=null,baseline=null,covered=false,running=false,since=0;
+const NOISE=[2,1,0.01];
+let stream=null,timer=null,wake=null,running=false,covered=false,ts=0,cal=null,calRun=0;
 
 async function keepAwake(){
   try{ if('wakeLock' in navigator && running) wake=await navigator.wakeLock.request('screen'); }catch(e){}
 }
 document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='visible') keepAwake(); });
 
-function luminance(){
+// features: [mean brightness, contrast (std), red share]
+function features(){
   ctx.drawImage(v,0,0,32,32);
-  const d=ctx.getImageData(0,0,32,32).data;
-  let s=0; for(let i=0;i<d.length;i+=4) s+=0.299*d[i]+0.587*d[i+1]+0.114*d[i+2];
-  return s/(d.length/4);
+  const d=ctx.getImageData(0,0,32,32).data, n=d.length/4;
+  let s=0,s2=0,R=0,G=0,B=0;
+  for(let i=0;i<d.length;i+=4){
+    const l=0.299*d[i]+0.587*d[i+1]+0.114*d[i+2];
+    s+=l; s2+=l*l; R+=d[i]; G+=d[i+1]; B+=d[i+2];
+  }
+  const m=s/n, sd=Math.sqrt(Math.max(0,s2/n-m*m));
+  return [m,sd,R/(R+G+B+1)];
 }
-function setCovered(x){
-  if(x===covered) return;
-  covered=x; light.classList.toggle('off',covered);
+function sample(ms){
+  return new Promise(res=>{
+    const arr=[],t0=Date.now();
+    const iv=setInterval(()=>{
+      if(v.readyState>=2) arr.push(features());
+      if(Date.now()-t0>=ms){clearInterval(iv);res(arr);}
+    },80);
+  });
+}
+function stats(arr){
+  const k=3, mean=[0,0,0], sd=[0,0,0];
+  for(const f of arr) for(let i=0;i<k;i++) mean[i]+=f[i]/arr.length;
+  for(const f of arr) for(let i=0;i<k;i++) sd[i]+=Math.pow(f[i]-mean[i],2)/arr.length;
+  return {mean, sd: sd.map(Math.sqrt)};
+}
+const wait=ms=>new Promise(r=>setTimeout(r,ms));
+async function countdown(text,secs,id){
+  for(let s=secs;s>0;s--){
+    if(id!==calRun) return false;
+    label.textContent=text+'  '+s;
+    await wait(1000);
+  }
+  return id===calRun;
+}
+async function calibrate(){
+  const id=++calRun;
+  running=true; clearInterval(timer);
+  covered=false; light.classList.remove('off');
+  stopBtn.style.display='none'; recalBtn.style.display='none'; dbg.style.display='none';
+  label.style.display='flex';
+  if(!await countdown('Step 1: keep your hand AWAY from the camera.',3,id)) return;
+  label.textContent='Reading…';
+  const open=stats(await sample(2000));
+  if(id!==calRun) return;
+  if(!await countdown('Step 2: COVER the front camera with your hand and hold it.',4,id)) return;
+  label.textContent='Reading… keep holding';
+  const cov=stats(await sample(2000));
+  if(id!==calRun) return;
+  const sep=[0,1,2].map(i=>Math.abs(cov.mean[i]-open.mean[i])/(open.sd[i]+cov.sd[i]+NOISE[i]));
+  if(Math.max(...sep)<2.5){
+    label.textContent='Could not tell the difference. Cover the camera fully. Trying again…';
+    await wait(2500);
+    if(id===calRun) calibrate();
+    return;
+  }
+  cal={open:open.mean,cov:cov.mean,sep};
+  label.textContent='Done! Now remove your hand.';
+  await wait(1500);
+  if(id!==calRun) return;
+  label.style.display='none';
+  stopBtn.style.display='block'; recalBtn.style.display='block'; dbg.style.display='block';
+  ts=0; covered=false;
+  keepAwake();
+  timer=setInterval(tick,80);
 }
 function tick(){
-  if(v.readyState<2) return;
-  const l=luminance();
-  if(baseline===null){ baseline=Math.max(l,25); since=Date.now(); return; }
-  if(!covered){
-    // track ambient level while uncovered (rises fast, falls slowly)
-    baseline = l>baseline ? baseline*0.7+l*0.3 : baseline*0.98+l*0.02;
-    if(l < baseline*0.35 || l < 6) setCovered(true);
-  } else {
-    if(l > baseline*0.55 && l > 8) setCovered(false);
+  if(v.readyState<2||!cal) return;
+  const f=features();
+  let num=0,den=0;
+  for(let i=0;i<3;i++){
+    if(cal.sep[i]<2) continue;
+    let t=(f[i]-cal.open[i])/(cal.cov[i]-cal.open[i]);
+    t=Math.max(-0.5,Math.min(1.5,t));
+    const w=Math.min(cal.sep[i],10);
+    num+=w*t; den+=w;
   }
+  const t=den?num/den:0;
+  ts=ts*0.5+t*0.5;
+  dbg.textContent='score '+ts.toFixed(2);
+  if(!covered && ts>0.6){covered=true;light.classList.add('off');}
+  else if(covered && ts<0.4){covered=false;light.classList.remove('off');}
 }
 async function begin(){
   msg.textContent='';
@@ -72,19 +143,18 @@ async function begin(){
     return;
   }
   v.srcObject=stream; await v.play().catch(()=>{});
-  running=true; baseline=null; covered=false;
-  startEl.style.display='none'; light.style.display='block'; light.classList.remove('off'); stopBtn.style.display='block';
-  keepAwake();
-  timer=setInterval(tick,80);
+  startEl.style.display='none'; light.style.display='block';
+  calibrate();
 }
 function end(){
-  running=false; clearInterval(timer);
+  calRun++; running=false; clearInterval(timer);
   if(stream) stream.getTracks().forEach(t=>t.stop());
   if(wake){ try{wake.release()}catch(e){} wake=null; }
-  light.style.display='none'; stopBtn.style.display='none'; startEl.style.display='flex';
+  light.style.display='none'; label.style.display='none';
+  stopBtn.style.display='none'; recalBtn.style.display='none'; dbg.style.display='none';
+  startEl.style.display='flex';
 }
-$('go').onclick=begin; stopBtn.onclick=end;
+$('go').onclick=begin; stopBtn.onclick=end; recalBtn.onclick=calibrate;
 </script>
 </body>
 </html>
-
