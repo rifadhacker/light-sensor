@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Yellow Light</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<style>
+  :root { --yellow:#ffe600; --black:#000; }
+  html,body{margin:0;height:100%;background:var(--black);overflow:hidden;font-family:-apple-system,system-ui,sans-serif;-webkit-user-select:none;user-select:none}
+  #light{position:fixed;inset:0;background:var(--yellow);display:none}
+  #light.off{background:var(--black)}
+  #start{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;color:#fff;text-align:center;padding:24px}
+  #start button{font-size:20px;font-weight:600;padding:16px 32px;border:0;border-radius:14px;background:var(--yellow);color:#000}
+  #start p{max-width:320px;opacity:.75;font-size:15px;line-height:1.4;margin:0}
+  #msg{color:#ff8a80;min-height:20px}
+  #stop{position:fixed;top:calc(env(safe-area-inset-top,0px) + 8px);right:8px;opacity:.25;border:0;background:#000;color:#fff;border-radius:8px;padding:6px 10px;font-size:13px;display:none}
+  #light.off ~ #stop{display:none!important}
+  video,canvas{position:fixed;width:1px;height:1px;opacity:0;pointer-events:none}
+</style>
+</head>
+<body>
+<div id="start">
+  <h2>Yellow Light</h2>
+  <p>Cover the front camera with your hand and the light turns off. Remove it and it comes back. Safari will ask for camera access.</p>
+  <button id="go">Start</button>
+  <p id="msg"></p>
+</div>
+<div id="light"></div>
+<button id="stop">Stop</button>
+<video id="v" playsinline muted autoplay></video>
+<canvas id="c" width="32" height="32"></canvas>
+<script>
+const $=id=>document.getElementById(id);
+const light=$('light'),startEl=$('start'),stopBtn=$('stop'),msg=$('msg'),v=$('v'),c=$('c');
+const ctx=c.getContext('2d',{willReadFrequently:true});
+let stream=null,timer=null,wake=null,baseline=null,covered=false,running=false,since=0;
+
+async function keepAwake(){
+  try{ if('wakeLock' in navigator && running) wake=await navigator.wakeLock.request('screen'); }catch(e){}
+}
+document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='visible') keepAwake(); });
+
+function luminance(){
+  ctx.drawImage(v,0,0,32,32);
+  const d=ctx.getImageData(0,0,32,32).data;
+  let s=0; for(let i=0;i<d.length;i+=4) s+=0.299*d[i]+0.587*d[i+1]+0.114*d[i+2];
+  return s/(d.length/4);
+}
+function setCovered(x){
+  if(x===covered) return;
+  covered=x; light.classList.toggle('off',covered);
+}
+function tick(){
+  if(v.readyState<2) return;
+  const l=luminance();
+  if(baseline===null){ baseline=Math.max(l,25); since=Date.now(); return; }
+  if(!covered){
+    // track ambient level while uncovered (rises fast, falls slowly)
+    baseline = l>baseline ? baseline*0.7+l*0.3 : baseline*0.98+l*0.02;
+    if(l < baseline*0.35 || l < 6) setCovered(true);
+  } else {
+    if(l > baseline*0.55 && l > 8) setCovered(false);
+  }
+}
+async function begin(){
+  msg.textContent='';
+  try{
+    stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:{ideal:160},height:{ideal:120}},audio:false});
+  }catch(e){
+    msg.textContent='Camera access is needed. Allow it in Safari settings and try again. (If this page is embedded, open it directly in Safari.)';
+    return;
+  }
+  v.srcObject=stream; await v.play().catch(()=>{});
+  running=true; baseline=null; covered=false;
+  startEl.style.display='none'; light.style.display='block'; light.classList.remove('off'); stopBtn.style.display='block';
+  keepAwake();
+  timer=setInterval(tick,80);
+}
+function end(){
+  running=false; clearInterval(timer);
+  if(stream) stream.getTracks().forEach(t=>t.stop());
+  if(wake){ try{wake.release()}catch(e){} wake=null; }
+  light.style.display='none'; stopBtn.style.display='none'; startEl.style.display='flex';
+}
+$('go').onclick=begin; stopBtn.onclick=end;
+</script>
+</body>
+</html>
+
